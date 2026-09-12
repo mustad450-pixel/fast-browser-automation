@@ -50,21 +50,46 @@ jobs:
           $shaFile = "$installer.sha256.txt"
           $fileName = [System.IO.Path]::GetFileName($installer)
 
-          $cosignCommand = Get-Command cosign-windows-amd64 -ErrorAction SilentlyContinue
-          if (-not $cosignCommand) {
-            $cosignCommand = Get-Command cosign-windows-amd64.exe -ErrorAction SilentlyContinue
-          }
-          if (-not $cosignCommand) {
-            $cosignCommand = Get-Command cosign -ErrorAction SilentlyContinue
-          }
-          if (-not $cosignCommand) {
-            throw 'Cosign was not found on the self-hosted runner. Install Sigstore Cosign v3.1.3 first.'
+          # Prefer a runner-local Cosign binary so the workflow does not depend on
+          # an interactive user's PATH or WinGet command aliases.
+          $cosign = $null
+          $runnerLocalCosign = 'C:\actions-runner\tools\cosign.exe'
+          if (Test-Path -LiteralPath $runnerLocalCosign -PathType Leaf) {
+            $cosign = $runnerLocalCosign
           }
 
-          $cosign = $cosignCommand.Path
-          if (-not $cosign) { $cosign = $cosignCommand.Source }
-          if (-not $cosign) { throw 'Unable to resolve the Cosign executable path.' }
+          if (-not $cosign) {
+            $candidatePaths = @()
+            if ($env:LOCALAPPDATA) {
+              $candidatePaths += (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\cosign-windows-amd64.exe')
+            }
+            if ($env:USERPROFILE) {
+              $candidatePaths += (Join-Path $env:USERPROFILE 'AppData\Local\Microsoft\WinGet\Links\cosign-windows-amd64.exe')
+            }
+            foreach ($candidate in $candidatePaths) {
+              if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $cosign = $candidate
+                break
+              }
+            }
+          }
 
+          if (-not $cosign) {
+            foreach ($name in @('cosign-windows-amd64', 'cosign-windows-amd64.exe', 'cosign')) {
+              $command = Get-Command $name -ErrorAction SilentlyContinue
+              if ($command) {
+                $cosign = $command.Path
+                if (-not $cosign) { $cosign = $command.Source }
+                if ($cosign) { break }
+              }
+            }
+          }
+
+          if (-not $cosign) {
+            throw 'Cosign was not found. Place cosign.exe at C:\actions-runner\tools\cosign.exe.'
+          }
+
+          Write-Host "Using Cosign: $cosign"
           $versionOutput = (& $cosign version 2>&1 | Out-String)
           $versionOutput | Write-Host
           if ($LASTEXITCODE -ne 0) { throw 'Cosign version check failed.' }
