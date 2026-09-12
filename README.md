@@ -1,2 +1,2 @@
-# name-fast-browser-automation
+# fast-browser-automation
 Fast Browser
