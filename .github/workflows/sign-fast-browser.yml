@@ -8,6 +8,8 @@ on:
         required: true
         default: 'C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe'
         type: string
+  schedule:
+    - cron: '17 * * * *'
 
 permissions:
   contents: read
@@ -24,10 +26,10 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Sign and verify installer
+      - name: Sign or verify installer
         shell: powershell
         env:
-          INSTALLER_PATH: ${{ inputs.installer_path }}
+          INSTALLER_PATH: ${{ github.event.inputs.installer_path || 'C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe' }}
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -37,11 +39,16 @@ jobs:
 
           $installer = [System.IO.Path]::GetFullPath($env:INSTALLER_PATH)
           if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            if ($env:GITHUB_EVENT_NAME -eq 'schedule') {
+              Write-Host "Scheduled check skipped: installer not found: $installer"
+              exit 0
+            }
             throw "Installer not found: $installer"
           }
 
           $bundle = "$installer.github-actions.sigstore.json"
           $shaFile = "$installer.sha256.txt"
+          $fileName = [System.IO.Path]::GetFileName($installer)
 
           $cosignCommand = Get-Command cosign-windows-amd64 -ErrorAction SilentlyContinue
           if (-not $cosignCommand) {
@@ -65,28 +72,69 @@ jobs:
             throw 'Expected Cosign v3.1.3. Refusing to sign with an unreviewed version.'
           }
 
+          # Refuse to sign a file that is still changing while a build/copy is in progress.
           $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          $fileName = [System.IO.Path]::GetFileName($installer)
-          "$hash  $fileName" | Set-Content -LiteralPath $shaFile -Encoding ascii
+          Start-Sleep -Seconds 5
+          $hashCheck = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $hashCheck) {
+            if ($env:GITHUB_EVENT_NAME -eq 'schedule') {
+              Write-Host 'Scheduled check skipped: installer changed during stability check.'
+              exit 0
+            }
+            throw 'Installer changed during stability check. Refusing to sign.'
+          }
 
+          $identity = "https://github.com/$env:GITHUB_WORKFLOW_REF"
+          $issuer = 'https://token.actions.githubusercontent.com'
+
+          # If the exact current installer is already signed, verify it and do nothing else.
+          $alreadySigned = $false
+          if ((Test-Path -LiteralPath $bundle -PathType Leaf) -and (Test-Path -LiteralPath $shaFile -PathType Leaf)) {
+            $recorded = ((Get-Content -LiteralPath $shaFile -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+            if ($recorded -eq $hash) {
+              Write-Host 'Current installer hash already has a GitHub Actions Sigstore bundle. Verifying...'
+              & $cosign verify-blob $installer `
+                --bundle $bundle `
+                --certificate-identity $identity `
+                --certificate-oidc-issuer $issuer
+              if ($LASTEXITCODE -ne 0) {
+                throw 'Existing Sigstore bundle matches the current hash record but verification failed. Refusing to overwrite it.'
+              }
+              $alreadySigned = $true
+            }
+          }
+
+          if ($alreadySigned) {
+            "## Fast Browser Sigstore signing" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            "" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            "- Installer: ``$fileName``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            "- SHA-256: ``$hash``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            "- Result: **Already signed; verification OK**" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            Write-Host 'SUCCESS: Current installer was already signed and verified. No new signature created.'
+            exit 0
+          }
+
+          # New installer: sign first, verify exact workload identity, then publish its hash record.
           Remove-Item -LiteralPath $bundle -Force -ErrorAction SilentlyContinue
 
-          Write-Host 'Signing with GitHub Actions OIDC identity...'
+          Write-Host 'New installer detected. Signing with GitHub Actions OIDC identity...'
           & $cosign sign-blob --yes --bundle $bundle $installer
           if ($LASTEXITCODE -ne 0) { throw 'Sigstore signing failed.' }
           if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) {
             throw 'Cosign returned success but the Sigstore bundle was not created.'
           }
 
-          $identity = "https://github.com/$env:GITHUB_WORKFLOW_REF"
-          $issuer = 'https://token.actions.githubusercontent.com'
-
           Write-Host "Verifying exact workflow identity: $identity"
           & $cosign verify-blob $installer `
             --bundle $bundle `
             --certificate-identity $identity `
             --certificate-oidc-issuer $issuer
-          if ($LASTEXITCODE -ne 0) { throw 'Sigstore verification failed.' }
+          if ($LASTEXITCODE -ne 0) {
+            Remove-Item -LiteralPath $bundle -Force -ErrorAction SilentlyContinue
+            throw 'Sigstore verification failed. Unverified bundle removed.'
+          }
+
+          "$hash  $fileName" | Set-Content -LiteralPath $shaFile -Encoding ascii
 
           "## Fast Browser Sigstore signing" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           "" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
@@ -94,8 +142,8 @@ jobs:
           "- SHA-256: ``$hash``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           "- Identity: ``$identity``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           "- Issuer: ``$issuer``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
-          "- Result: **Signed and Verified OK**" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "- Result: **New installer signed and Verified OK**" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
 
-          Write-Host 'SUCCESS: Fast Browser installer signed and verified.'
+          Write-Host 'SUCCESS: New Fast Browser installer signed and verified.'
           Write-Host "Bundle: $bundle"
           Write-Host "SHA-256 file: $shaFile"
