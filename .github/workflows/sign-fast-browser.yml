@@ -1,77 +1,101 @@
-name: Sign Fast Browser
+name: Sign Fast Browser installer
 
 on:
   workflow_dispatch:
+    inputs:
+      installer_path:
+        description: Absolute path to the Fast Browser installer on the self-hosted runner
+        required: true
+        default: 'C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe'
+        type: string
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: fast-browser-signing
+  group: fast-browser-sigstore-signing
   cancel-in-progress: false
 
 jobs:
   sign:
-    name: Sigstore sign and verify
-    runs-on: [self-hosted, Windows, X64]
+    name: Keyless Sigstore sign and verify
+    runs-on: [self-hosted, Windows, X64, fast-browser]
     timeout-minutes: 15
 
-    env:
-      FAST_BROWSER_EXE: C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe
-      FAST_BROWSER_BUNDLE: C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe.github-actions.sigstore.json
-      FAST_BROWSER_HASH: C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe.sha256.txt
-
     steps:
-      - name: Preflight
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path -LiteralPath $env:FAST_BROWSER_EXE)) {
-            throw "Installer not found: $env:FAST_BROWSER_EXE"
-          }
-          $cosign = Get-Command cosign-windows-amd64 -ErrorAction Stop
-          Write-Host "Cosign: $($cosign.Source)"
-          & cosign-windows-amd64 version
-
-      - name: Create SHA-256 checksum
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $hash = (Get-FileHash -LiteralPath $env:FAST_BROWSER_EXE -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  Fast-Browser-v1.2-Final-Setup.exe" | Set-Content -LiteralPath $env:FAST_BROWSER_HASH -Encoding ascii
-          Get-Content -LiteralPath $env:FAST_BROWSER_HASH
-
-      - name: Sign with GitHub OIDC and Sigstore
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Remove-Item -LiteralPath $env:FAST_BROWSER_BUNDLE -Force -ErrorAction SilentlyContinue
-          & cosign-windows-amd64 sign-blob `
-            --yes `
-            --bundle $env:FAST_BROWSER_BUNDLE `
-            $env:FAST_BROWSER_EXE
-          if ($LASTEXITCODE -ne 0) { throw "Cosign signing failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path -LiteralPath $env:FAST_BROWSER_BUNDLE)) { throw "Sigstore bundle was not created" }
-
-      - name: Verify exact GitHub Actions identity
+      - name: Sign and verify installer
         shell: powershell
         env:
-          EXPECTED_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          INSTALLER_PATH: ${{ inputs.installer_path }}
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "Expected identity: $env:EXPECTED_IDENTITY"
-          & cosign-windows-amd64 verify-blob `
-            $env:FAST_BROWSER_EXE `
-            --bundle $env:FAST_BROWSER_BUNDLE `
-            --certificate-identity $env:EXPECTED_IDENTITY `
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com
-          if ($LASTEXITCODE -ne 0) { throw "Cosign verification failed with exit code $LASTEXITCODE" }
 
-      - name: Final status
-        shell: powershell
-        run: |
-          Write-Host "SIGNING COMPLETE"
-          Write-Host "Installer: $env:FAST_BROWSER_EXE"
-          Write-Host "Bundle:    $env:FAST_BROWSER_BUNDLE"
-          Write-Host "SHA-256:   $env:FAST_BROWSER_HASH"
+          if ($env:RUNNER_OS -ne 'Windows') {
+            throw 'This workflow requires a Windows self-hosted runner.'
+          }
+
+          $installer = [System.IO.Path]::GetFullPath($env:INSTALLER_PATH)
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Installer not found: $installer"
+          }
+
+          $bundle = "$installer.github-actions.sigstore.json"
+          $shaFile = "$installer.sha256.txt"
+
+          $cosignCommand = Get-Command cosign-windows-amd64 -ErrorAction SilentlyContinue
+          if (-not $cosignCommand) {
+            $cosignCommand = Get-Command cosign-windows-amd64.exe -ErrorAction SilentlyContinue
+          }
+          if (-not $cosignCommand) {
+            $cosignCommand = Get-Command cosign -ErrorAction SilentlyContinue
+          }
+          if (-not $cosignCommand) {
+            throw 'Cosign was not found on the self-hosted runner. Install Sigstore Cosign v3.1.3 first.'
+          }
+
+          $cosign = $cosignCommand.Path
+          if (-not $cosign) { $cosign = $cosignCommand.Source }
+          if (-not $cosign) { throw 'Unable to resolve the Cosign executable path.' }
+
+          $versionOutput = (& $cosign version 2>&1 | Out-String)
+          $versionOutput | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Cosign version check failed.' }
+          if ($versionOutput -notmatch 'GitVersion:\s+v3\.1\.3\b') {
+            throw 'Expected Cosign v3.1.3. Refusing to sign with an unreviewed version.'
+          }
+
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $fileName = [System.IO.Path]::GetFileName($installer)
+          "$hash  $fileName" | Set-Content -LiteralPath $shaFile -Encoding ascii
+
+          Remove-Item -LiteralPath $bundle -Force -ErrorAction SilentlyContinue
+
+          Write-Host 'Signing with GitHub Actions OIDC identity...'
+          & $cosign sign-blob --yes --bundle $bundle $installer
+          if ($LASTEXITCODE -ne 0) { throw 'Sigstore signing failed.' }
+          if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) {
+            throw 'Cosign returned success but the Sigstore bundle was not created.'
+          }
+
+          $identity = "https://github.com/$env:GITHUB_WORKFLOW_REF"
+          $issuer = 'https://token.actions.githubusercontent.com'
+
+          Write-Host "Verifying exact workflow identity: $identity"
+          & $cosign verify-blob $installer `
+            --bundle $bundle `
+            --certificate-identity $identity `
+            --certificate-oidc-issuer $issuer
+          if ($LASTEXITCODE -ne 0) { throw 'Sigstore verification failed.' }
+
+          "## Fast Browser Sigstore signing" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "- Installer: ``$fileName``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "- SHA-256: ``$hash``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "- Identity: ``$identity``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "- Issuer: ``$issuer``" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "- Result: **Signed and Verified OK**" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+          Write-Host 'SUCCESS: Fast Browser installer signed and verified.'
+          Write-Host "Bundle: $bundle"
+          Write-Host "SHA-256 file: $shaFile"
