@@ -20,7 +20,7 @@ concurrency:
 jobs:
   sign:
     name: Keyless Sigstore sign and verify
-    runs-on: [self-hosted, Windows, X64, fast-browser]
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 15
 
     steps:
