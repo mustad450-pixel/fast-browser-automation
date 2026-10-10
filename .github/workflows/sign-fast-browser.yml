@@ -6,7 +6,7 @@ on:
       installer_path:
         description: Absolute path to the Fast Browser installer on the self-hosted runner
         required: true
-        default: 'C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe'
+        default: 'C:\src\browser-project\Fast-Browser-v1.2.2-Final\Fast-Browser-Setup.exe'
         type: string
   schedule:
     - cron: '17 * * * *'
@@ -29,7 +29,7 @@ jobs:
       - name: Sign or verify installer
         shell: powershell
         env:
-          INSTALLER_PATH: ${{ github.event.inputs.installer_path || 'C:\src\browser-project\Fast-Browser-v1.2-Final\Fast-Browser-v1.2-Final-Setup.exe' }}
+          INSTALLER_PATH: ${{ github.event.inputs.installer_path || 'C:\src\browser-project\Fast-Browser-v1.2.2-Final\Fast-Browser-Setup.exe' }}
         run: |
           $ErrorActionPreference = 'Stop'
 
